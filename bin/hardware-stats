@@ -23,7 +23,13 @@ Output shape (stable contract for the QML side):
 }
 Every value that a machine cannot report reads as null — never zero — so the UI
 can distinguish "idle" from "no counter".
+
+OLD-LAPTOP FRIENDLY: a shared cache (XDG cache / hermes-hardware/stats.json)
+with a short TTL plus an flock single-flight window (stats.lock) means the two
+per-monitor instances share ONE real sample instead of each spawning
+`sensors` + `lspci` on every interval.
 """
+import fcntl
 import json
 import os
 import re
@@ -39,6 +45,11 @@ DRM = Path("/sys/class/drm")
 
 VENDORS = {"0x1002": "amd", "0x8086": "intel", "0x10de": "nvidia"}
 
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "hermes-hardware"
+CACHE_TTL = float(os.environ.get("HERMES_CACHE_TTL", 2.0))
+CACHE_PATH = CACHE_DIR / "stats.json"
+LOCK_PATH = CACHE_DIR / "stats.lock"
+
 
 def _read(path):
     try:
@@ -53,11 +64,12 @@ def cpu_percent(sample_interval=0.12):
     def snap():
         out = {}
         for line in PROC_STAT.read_text().splitlines():
-            if line == "" or not (line.startswith("cpu") and line[3:4].isdigit() or line == "cpu " ):
+            if not line.startswith("cpu"):
                 continue
-            parts = line.split()
-            key = parts[0]
-            vals = [int(v) for v in parts[1:8]]
+            key = line.split()[0]
+            if key != "cpu" and not key[3:].isdigit():
+                continue
+            vals = [int(v) for v in line.split()[1:8]]
             idle = vals[3] + vals[4]
             out[key] = (sum(vals), idle)
         return out
@@ -98,7 +110,7 @@ def memory():
     swap_free = vals.get("SwapFree", 0)
     swap_used = max(0, swap_total - swap_free)
 
-    doc = {
+    return {
         "percent": round(100 * used / total) if total else None,
         "usedGiB": round(used / 1024 ** 3, 1),
         "totalGiB": round(total / 1024 ** 3, 1),
@@ -106,7 +118,6 @@ def memory():
         "swapUsedGiB": round(swap_used / 1024 ** 3, 1),
         "swapTotalGiB": round(swap_total / 1024 ** 3, 1),
     }
-    return doc
 
 
 # ── temperatures ───────────────────────────────────────────────────────────
@@ -116,24 +127,6 @@ def sensors():
     try:
         raw = subprocess.check_output(["sensors", "-j"], text=True,
                                       stderr=subprocess.DEVNULL, timeout=2)
-        def walk(value, chip="", label=""):
-            if isinstance(value, dict):
-                for k, v in value.items():
-                    if k in ("temp1_input",) or re.match(r"temp\d+_input", k):
-                        try:
-                            found.append({"label": f"{chip} · {label}" if label else chip,
-                                          "celsius": round(float(v), 1)})
-                        except (TypeError, ValueError):
-                            pass
-                    elif k.endswith("_label"):
-                        walk(v, chip)
-                    else:
-                        walk(v, chip, k if k.endswith("_label") is False and k not in ("Adapter", "Chip") else label)
-                    # labels: prefer explicit *_label content next pass
-            elif isinstance(value, list):
-                for v in value:
-                    walk(v, chip, label)
-        # second pass to attach human labels where lm-sensors provides them
         doc = json.loads(raw)
         for chip, entries in doc.items():
             if not isinstance(entries, dict):
@@ -159,7 +152,7 @@ def sensors():
             try:
                 t = (tz / "temp").read_text().strip()
                 ttype = (tz / "type").read_text().strip()
-                found.append({"label": f"{ttype}", "celsius": round(int(t) / 1000, 1)})
+                found.append({"label": ttype, "celsius": round(int(t) / 1000, 1)})
             except (OSError, ValueError):
                 pass
     return found
@@ -186,46 +179,23 @@ def gpus():
     found = []
     names = _pci_names()
     for card in sorted(DRM.glob("card*")):
-        if not card.is_dir() or card.name == "card0" and not (card / "device" / "vendor").exists():
-            pass
         dev = card / "device"
-        vendor_f = dev / "vendor"
-        if not vendor_f.exists():
+        if not dev.exists():
             continue
-        try:
-            vendor = vendor_f.read_text().strip()
-        except (OSError, ValueError):
-            continue
-        gtype = VENDORS.get(vendor)
+        vendor = _read(dev / "vendor")
+        gtype = VENDORS.get(vendor) if vendor else None
         if gtype is None:
             continue
 
-        # human name: match sysfs PCI address to lspci
-        try:
-            addr = os.path.basename(os.path.realpath(str(dev))).rsplit("/", 2)[-2]
-        except Exception:
-            addr = ""
+        # human name: sysfs canonical path carries the PCI address
         sys_pci = ""
         try:
-            # canonical path like .../pci0000:00/0000:00:02.0/drm/card1
             canon = Path(os.path.realpath(str(dev)))
-            sys_pci = canon.parent.name.lower()
+            sys_pci = canon.parent.name.lower()  # "0000:00:02.0"
         except Exception:
-            sys_pci = ""
-        gname = names.get(sys_pci)
-        if gname is None:
-            try:
-                modalias = (dev / "modalias").read_text().strip()
-                m = re.search(r"pci:v(\d{8})", modalias)
-                # last resort: match by vendor substring in any lspci line
-                vid = hex(int(m.group(1), 16)) if m else None
-            except Exception:
-                vid = None
-            for a, n in names.items():
-                if vid and (vid[2:] in a or True):
-                    pass
-        entry = {"type": gtype, "name": gname, "percent": None, "tempC": None,
-                 "vramUsedMiB": None, "vramTotalMiB": None}
+            pass
+        entry = {"type": gtype, "name": names.get(sys_pci), "percent": None,
+                 "tempC": None, "vramUsedMiB": None, "vramTotalMiB": None}
 
         busy = _read(dev / "gpu_busy_percent")
         if busy is not None:
@@ -233,14 +203,16 @@ def gpus():
                 entry["percent"] = int(busy)
             except ValueError:
                 pass
-        for h in (dev / "hwmon").glob("*") if (dev / "hwmon").exists() else []:
-            t = _read(h / "temp1_input")
-            if t:
-                try:
-                    entry["tempC"] = round(int(t) / 1000)
-                except ValueError:
-                    pass
-            break
+        hwmon = dev / "hwmon"
+        if hwmon.exists():
+            for h in hwmon.glob("*"):
+                t = _read(h / "temp1_input")
+                if t:
+                    try:
+                        entry["tempC"] = round(int(t) / 1000)
+                    except ValueError:
+                        pass
+                break
         used = _read(dev / "mem_info_vram_used")
         tot = _read(dev / "mem_info_vram_total")
         if used and tot:
@@ -287,14 +259,13 @@ def disks(min_gib):
             "usedGiB": round(used / 1024 ** 3, 1),
             "totalGiB": round(total / 1024 ** 3, 1),
         })
-    # root last so it renders closest to the panel top
     out.sort(key=lambda d: d["mount"] != "/")
     return out
 
 
-def main():
+def collect():
     mean, cores = cpu_percent()
-    doc = {
+    return {
         "schema": 1,
         "ts": int(time.time()),
         "cpu": {"meanPercent": mean, "coresPercent": cores},
@@ -302,10 +273,38 @@ def main():
         "sensors": sensors(),
         "gpus": gpus(),
         "disks": disks(_env_int("HERMES_MIN_DISK_GIB", 1)),
-        "load": [round(v, 2) for v in os.getloadavg()],
+        "load": [round(x, 2) for x in os.getloadavg()],
         "uptimeSeconds": int(float(PROC_UPTIME.read_text().split()[0])),
     }
-    print(json.dumps(doc, separators=(",", ":")))
+
+
+def main():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    with open(LOCK_PATH, "w") as lock:
+        # Single-flight: if the twin per-monitor instance is already producing
+        # a sample, wait for it (bounded — collect() finishes well under 1 s)
+        # and then serve the shared file.
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        served = None
+        try:
+            candidate = json.loads(CACHE_PATH.read_text())
+            if time.time() - candidate.get("ts", 0) <= CACHE_TTL:
+                served = candidate
+        except (OSError, ValueError):
+            pass
+        if served is None:
+            try:
+                served = collect()
+            except Exception:
+                try:
+                    served = json.loads(CACHE_PATH.read_text())
+                except (OSError, ValueError):
+                    served = {"schema": 1, "ts": 0, "cpu": {"meanPercent": None, "coresPercent": []},
+                              "memory": {}, "sensors": [], "gpus": [], "disks": [],
+                              "load": [0.0, 0.0, 0.0], "uptimeSeconds": 0}
+            CACHE_PATH.write_text(json.dumps(served, separators=(",", ":")))
+        print(json.dumps(served, separators=(",", ":")))
 
 
 def _env_int(name, default):

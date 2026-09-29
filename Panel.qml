@@ -53,7 +53,17 @@ Panel {
   readonly property real diskCrit: Number(setting("diskCritPercent", 90))
   readonly property real tempWarn: Number(setting("tempWarnC", 80))
 
-  Timer { interval: panelRoot.intervalMs; running: true; repeat: true; triggeredOnStart: true; onTriggered: panelRoot.refresh() }
+  Timer {
+    // Old-laptop friendly adaptive cadence: the badge follows intervalSec
+    // while the panel is open; closed, it drops to a slow ambient rate so the
+    // sampler (and the subprocs it may spawn after the 2 s cache TTL) rarely
+    // wake the CPU.
+    interval: popup.opened ? panelRoot.intervalMs : Math.max(panelRoot.intervalMs * 5, 15000)
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: panelRoot.refresh()
+  }
 
   Process {
     id: statsProc
