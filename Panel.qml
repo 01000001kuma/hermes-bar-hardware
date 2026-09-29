@@ -27,7 +27,12 @@ Panel {
   function refresh() { if (!statsProc.running) statsProc.running = true }
 
   function pushHistory() {
-    var h = history
+    // Reassigning the same (mutated) object does NOT fire change notifications,
+    // so the sparkline bindings never re-evaluated and the canvases stayed
+    // empty. Build a fresh object with cloned arrays every sample — QML only
+    // reacts to the reference swap.
+    var h = {}
+    for (var k in history) h[k] = history[k].slice()
     function add(series, value) {
       if (value === null || value === undefined) return
       if (!h[series]) h[series] = []
@@ -108,14 +113,19 @@ Panel {
             }
           }
         }
-        Row {
-          spacing: Style.space(8)
-          Meter { label: "RAM"; frac: doc.memory ? doc.memory.percent / 100 : 0; text: doc.memory ? doc.memory.usedGiB + " / " + doc.memory.totalGiB + " GiB" : "--" }
-          Meter {
-            label: "swap"
-            frac: (doc.memory && doc.memory.swapPercent !== null && doc.memory.swapPercent !== undefined) ? doc.memory.swapPercent / 100 : 0
-            text: doc.memory && doc.memory.swapTotalGiB > 0 ? doc.memory.swapUsedGiB + " / " + doc.memory.swapTotalGiB + " GiB" : "none"
-          }
+        // One meter per line: values render at natural width so no number is
+        // ever elided away (the whole point of the drill-down).
+        Meter {
+          label: "RAM"
+          labelWidth: 40
+          frac: doc.memory ? doc.memory.percent / 100 : 0
+          text: doc.memory ? doc.memory.usedGiB + " / " + doc.memory.totalGiB + " GiB" : "--"
+        }
+        Meter {
+          label: "swap"
+          labelWidth: 40
+          frac: (doc.memory && doc.memory.swapPercent !== null && doc.memory.swapPercent !== undefined) ? doc.memory.swapPercent / 100 : 0
+          text: doc.memory && doc.memory.swapTotalGiB > 0 ? doc.memory.swapUsedGiB + " / " + doc.memory.swapTotalGiB + " GiB" : "none"
         }
       }
 
@@ -184,6 +194,8 @@ Panel {
           delegate: Meter {
             required property var modelData
             label: modelData.mount
+            // longest plausible mount point; value text stays natural-width
+            labelWidth: 132
             frac: modelData.percent / 100
             text: modelData.usedGiB + " / " + modelData.totalGiB + " GiB"
             warnAt: panelRoot.diskWarn / 100
@@ -220,7 +232,10 @@ Panel {
     width: parent ? parent.width : 84
     height: 22
     antialiasing: true
+    renderStrategy: Canvas.Cooperative
     onValuesChanged: requestPaint()
+    onWidthChanged: requestPaint()
+    Component.onCompleted: requestPaint()
     onPaint: {
       var ctx = getContext("2d")
       ctx.clearRect(0, 0, width, height)
@@ -233,8 +248,8 @@ Panel {
         var y = height - (height * Math.min(max, values[i]) / max)
         if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y)
       }
-      ctx.strokeStyle = Color.foreground
-      ctx.lineWidth = 1.2
+      ctx.strokeStyle = Color.accent
+      ctx.lineWidth = 1.4
       ctx.stroke()
     }
   }
@@ -246,8 +261,9 @@ Panel {
     property string text: ""
     property real warnAt: 999
     property real critAt: 999
+    property int labelWidth: 40
     spacing: Style.space(6)
-    Text { text: meter.label; color: Color.muted; font.family: Style.font.family; font.pixelSize: 10 }
+    Text { text: meter.label; width: meter.labelWidth; color: Color.muted; font.family: Style.font.family; font.pixelSize: 10; elide: Text.ElideRight }
     Rectangle {
       width: 90
       height: 7
@@ -262,6 +278,8 @@ Panel {
         color: meter.frac >= meter.critAt ? Color.urgent : meter.frac >= meter.warnAt ? "#d97706" : Color.accent
       }
     }
+    // Natural implicit width: eliding values hides the actual numbers, and this
+    // panel exists precisely to show them.
     Text { text: meter.text; color: Color.foreground; font.family: Style.font.family; font.pixelSize: 10 }
   }
 
