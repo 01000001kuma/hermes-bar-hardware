@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "id": "hermes.hardware",
+  "name": "Hermes Hardware",
+  "version": "0.1.0",
+  "author": "Adrian Molina (01000001kuma) & Hermes",
+  "license": "MIT",
+  "description": "Live CPU, memory, per-sensor temperatures, GPUs and disks with full drill-down: every number in the bar badge decomposes into the panel's details. Nothing hardcoded — cores, sensors, GPUs and mounts are discovered at runtime.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Hardware.qml" },
+  "barWidget": {
+    "displayName": "Hermes Hardware",
+    "description": "CPU / RAM / peak temperature badge with a drill-down panel: per-core sparklines, named sensors, every GPU, every real mount.",
+    "category": "System",
+    "allowMultiple": false,
+    "schema": [
+      {
+        "key": "intervalSec",
+        "type": "integer",
+        "label": "Sample interval (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 3
+      },
+      {
+        "key": "diskWarnPercent",
+        "type": "integer",
+        "label": "Disk warning threshold (%)",
+        "min": 0,
+        "max": 100,
+        "step": 1,
+        "defaultValue": 80
+      },
+      {
+        "key": "diskCritPercent",
+        "type": "integer",
+        "label": "Disk critical threshold (%)",
+        "min": 0,
+        "max": 100,
+        "step": 1,
+        "defaultValue": 90
+      },
+      {
+        "key": "tempWarnC",
+        "type": "integer",
+        "label": "CPU warning temperature (°C)",
+        "min": 0,
+        "max": 150,
+        "step": 1,
+        "defaultValue": 80
+      },
+      {
+        "key": "minDiskGiB",
+        "type": "integer",
+        "label": "Hide mounts smaller than (GiB)",
+        "min": 0,
+        "max": 100,
+        "step": 1,
+        "defaultValue": 1
+      }
+    ]
+  }
+}

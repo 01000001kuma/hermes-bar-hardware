@@ -1,0 +1,12 @@
+# Qt build artifacts
+*.pro.user
+*.qmlc
+*.jsc
+qmldir
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store

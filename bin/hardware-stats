@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""Hermes Hardware — machine stats sampler for the Omarchy bar.
+
+Pure stdlib. Discovers everything at runtime: CPU cores from /proc/stat,
+temperatures from lm-sensors (with /sys/class/thermal fallback), GPUs from
+/sys/class/drm (vendor-id keyed, names via lspci when available), mounts from
+/proc/self/mounts. Prints ONE JSON document.
+
+Output shape (stable contract for the QML side):
+{
+  "schema": 1,
+  "ts": <unix seconds>,
+  "cpu": {"meanPercent": float, "coresPercent": [float,...]},
+  "memory": {"percent": float, "usedGiB": float, "totalGiB": float,
+             "swapPercent": float|null, "swapUsedGiB": float, "swapTotalGiB": float},
+  "sensors": [{"label": str, "celsius": float}, ...],        # empty if none found
+  "gpus": [{"type": "amd"|"intel"|"nvidia"|"other", "name": str|null,
+            "percent": float|null, "tempC": float|null,
+            "vramUsedMiB": int|null, "vramTotalMiB": int|null}, ...],
+  "disks": [{"mount": str, "percent": int, "usedGiB": float, "totalGiB": float}, ...],
+  "load": [f, f, f],
+  "uptimeSeconds": int
+}
+Every value that a machine cannot report reads as null — never zero — so the UI
+can distinguish "idle" from "no counter".
+"""
+import json
+import os
+import re
+import subprocess
+import time
+from pathlib import Path
+
+PROC_STAT = Path("/proc/stat")
+PROC_MEMINFO = Path("/proc/meminfo")
+PROC_MOUNTS = Path("/proc/self/mounts")
+PROC_UPTIME = Path("/proc/uptime")
+DRM = Path("/sys/class/drm")
+
+VENDORS = {"0x1002": "amd", "0x8086": "intel", "0x10de": "nvidia"}
+
+
+def _read(path):
+    try:
+        return path.read_text().strip()
+    except (OSError, ValueError):
+        return None
+
+
+# ── CPU ────────────────────────────────────────────────────────────────────
+def cpu_percent(sample_interval=0.12):
+    """Mean + per-core utilization from two /proc/stat samples."""
+    def snap():
+        out = {}
+        for line in PROC_STAT.read_text().splitlines():
+            if line == "" or not (line.startswith("cpu") and line[3:4].isdigit() or line == "cpu " ):
+                continue
+            parts = line.split()
+            key = parts[0]
+            vals = [int(v) for v in parts[1:8]]
+            idle = vals[3] + vals[4]
+            out[key] = (sum(vals), idle)
+        return out
+
+    a = snap()
+    time.sleep(sample_interval)
+    b = snap()
+
+    cores = []
+    for key in sorted(k for k in b if k != "cpu"):
+        if key not in a:
+            continue
+        dt = b[key][0] - a[key][0]
+        di = b[key][1] - a[key][1]
+        cores.append(round(100 * (1 - di / dt)) if dt > 0 else 0)
+
+    if "cpu" in a and "cpu" in b:
+        dt = b["cpu"][0] - a["cpu"][0]
+        di = b["cpu"][1] - a["cpu"][1]
+        mean = round(100 * (1 - di / dt)) if dt > 0 else 0
+    else:
+        mean = round(sum(cores) / len(cores)) if cores else None
+
+    return mean, cores
+
+
+# ── memory ─────────────────────────────────────────────────────────────────
+def memory():
+    vals = {}
+    for line in PROC_MEMINFO.read_text().splitlines():
+        key, rest = line.split(":", 1)
+        vals[key] = int(rest.split()[0]) * 1024
+
+    total = vals.get("MemTotal", 0)
+    available = vals.get("MemAvailable", 0)
+    used = max(0, total - available)
+    swap_total = vals.get("SwapTotal", 0)
+    swap_free = vals.get("SwapFree", 0)
+    swap_used = max(0, swap_total - swap_free)
+
+    doc = {
+        "percent": round(100 * used / total) if total else None,
+        "usedGiB": round(used / 1024 ** 3, 1),
+        "totalGiB": round(total / 1024 ** 3, 1),
+        "swapPercent": round(100 * swap_used / swap_total) if swap_total else None,
+        "swapUsedGiB": round(swap_used / 1024 ** 3, 1),
+        "swapTotalGiB": round(swap_total / 1024 ** 3, 1),
+    }
+    return doc
+
+
+# ── temperatures ───────────────────────────────────────────────────────────
+def sensors():
+    """Named temperature sensors. lm-sensors first (labels), sysfs fallback."""
+    found = []
+    try:
+        raw = subprocess.check_output(["sensors", "-j"], text=True,
+                                      stderr=subprocess.DEVNULL, timeout=2)
+        def walk(value, chip="", label=""):
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    if k in ("temp1_input",) or re.match(r"temp\d+_input", k):
+                        try:
+                            found.append({"label": f"{chip} · {label}" if label else chip,
+                                          "celsius": round(float(v), 1)})
+                        except (TypeError, ValueError):
+                            pass
+                    elif k.endswith("_label"):
+                        walk(v, chip)
+                    else:
+                        walk(v, chip, k if k.endswith("_label") is False and k not in ("Adapter", "Chip") else label)
+                    # labels: prefer explicit *_label content next pass
+            elif isinstance(value, list):
+                for v in value:
+                    walk(v, chip, label)
+        # second pass to attach human labels where lm-sensors provides them
+        doc = json.loads(raw)
+        for chip, entries in doc.items():
+            if not isinstance(entries, dict):
+                continue
+            human = {}
+            for k, v in entries.items():
+                if k.endswith("_label") and isinstance(v, str):
+                    human[k.replace("_label", "")] = v
+            for k, v in entries.items():
+                if re.match(r"temp\d+_input", k):
+                    try:
+                        idx = k.split("_")[0]
+                        name = human.get(idx, idx)
+                        found.append({"label": f"{chip} · {name}",
+                                      "celsius": round(float(v) / 1000, 1)})
+                    except (TypeError, ValueError):
+                        pass
+    except Exception:
+        pass
+
+    if not found:
+        for tz in sorted(Path("/sys/class/thermal").glob("thermal_zone*")):
+            try:
+                t = (tz / "temp").read_text().strip()
+                ttype = (tz / "type").read_text().strip()
+                found.append({"label": f"{ttype}", "celsius": round(int(t) / 1000, 1)})
+            except (OSError, ValueError):
+                pass
+    return found
+
+
+# ── GPUs ───────────────────────────────────────────────────────────────────
+def _pci_names():
+    names = {}
+    try:
+        out = subprocess.check_output(["lspci"], text=True, timeout=2,
+                                      stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            low = line.lower()
+            if not any(t in low for t in ("vga compatible", "3d controller", "display controller")):
+                continue
+            addr = line.split()[0]
+            names[addr.lower()] = line.split(": ", 1)[-1]
+    except Exception:
+        pass
+    return names
+
+
+def gpus():
+    found = []
+    names = _pci_names()
+    for card in sorted(DRM.glob("card*")):
+        if not card.is_dir() or card.name == "card0" and not (card / "device" / "vendor").exists():
+            pass
+        dev = card / "device"
+        vendor_f = dev / "vendor"
+        if not vendor_f.exists():
+            continue
+        try:
+            vendor = vendor_f.read_text().strip()
+        except (OSError, ValueError):
+            continue
+        gtype = VENDORS.get(vendor)
+        if gtype is None:
+            continue
+
+        # human name: match sysfs PCI address to lspci
+        try:
+            addr = os.path.basename(os.path.realpath(str(dev))).rsplit("/", 2)[-2]
+        except Exception:
+            addr = ""
+        sys_pci = ""
+        try:
+            # canonical path like .../pci0000:00/0000:00:02.0/drm/card1
+            canon = Path(os.path.realpath(str(dev)))
+            sys_pci = canon.parent.name.lower()
+        except Exception:
+            sys_pci = ""
+        gname = names.get(sys_pci)
+        if gname is None:
+            try:
+                modalias = (dev / "modalias").read_text().strip()
+                m = re.search(r"pci:v(\d{8})", modalias)
+                # last resort: match by vendor substring in any lspci line
+                vid = hex(int(m.group(1), 16)) if m else None
+            except Exception:
+                vid = None
+            for a, n in names.items():
+                if vid and (vid[2:] in a or True):
+                    pass
+        entry = {"type": gtype, "name": gname, "percent": None, "tempC": None,
+                 "vramUsedMiB": None, "vramTotalMiB": None}
+
+        busy = _read(dev / "gpu_busy_percent")
+        if busy is not None:
+            try:
+                entry["percent"] = int(busy)
+            except ValueError:
+                pass
+        for h in (dev / "hwmon").glob("*") if (dev / "hwmon").exists() else []:
+            t = _read(h / "temp1_input")
+            if t:
+                try:
+                    entry["tempC"] = round(int(t) / 1000)
+                except ValueError:
+                    pass
+            break
+        used = _read(dev / "mem_info_vram_used")
+        tot = _read(dev / "mem_info_vram_total")
+        if used and tot:
+            try:
+                u, t2 = int(used), int(tot)
+                entry["vramUsedMiB"] = round(u / 1024 ** 2)
+                entry["vramTotalMiB"] = round(t2 / 1024 ** 2)
+            except ValueError:
+                pass
+        found.append(entry)
+    return found
+
+
+# ── disks ──────────────────────────────────────────────────────────────────
+FSTYPE_IGNORE = {"tmpfs", "devtmpfs", "proc", "sysfs", "efivarfs", "squashfs",
+                 "overlay", "cgroup2", "bpf", "tracefs", "debugfs", "securityfs",
+                 "pstore", "configfs", "fusectl", "hugetlbfs", "mqueue", "ramfs",
+                 "devpts", "binfmt_misc", "autofs", "fuse.gvfsd-fuse"}
+
+
+def disks(min_gib):
+    seen = set()
+    out = []
+    for line in PROC_MOUNTS.read_text().splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mount, fstype = parts[1], parts[2]
+        if fstype in FSTYPE_IGNORE or mount.startswith("/snap") or mount in seen:
+            continue
+        seen.add(mount)
+        try:
+            st = os.statvfs(mount)
+        except OSError:
+            continue
+        total = st.f_blocks * st.f_frsize
+        if total < min_gib * 1024 ** 3:
+            continue
+        free = st.f_bavail * st.f_frsize
+        used = total - free
+        out.append({
+            "mount": mount,
+            "percent": round(100 * used / total) if total else 0,
+            "usedGiB": round(used / 1024 ** 3, 1),
+            "totalGiB": round(total / 1024 ** 3, 1),
+        })
+    # root last so it renders closest to the panel top
+    out.sort(key=lambda d: d["mount"] != "/")
+    return out
+
+
+def main():
+    mean, cores = cpu_percent()
+    doc = {
+        "schema": 1,
+        "ts": int(time.time()),
+        "cpu": {"meanPercent": mean, "coresPercent": cores},
+        "memory": memory(),
+        "sensors": sensors(),
+        "gpus": gpus(),
+        "disks": disks(_env_int("HERMES_MIN_DISK_GIB", 1)),
+        "load": [round(v, 2) for v in os.getloadavg()],
+        "uptimeSeconds": int(float(PROC_UPTIME.read_text().split()[0])),
+    }
+    print(json.dumps(doc, separators=(",", ":")))
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+if __name__ == "__main__":
+    main()
