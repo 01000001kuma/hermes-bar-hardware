@@ -21,9 +21,7 @@ silent `0%` (the failure most widgets make).
 ## Install
 
 ```sh
-omarchy plugin clone 01000001kuma/hermes-bar-hardware
-omarchy plugin validate hermes.hardware
-omarchy plugin enable hermes.hardware
+omarchy plugin add https://github.com/01000001kuma/hermes-bar-hardware --enable
 ```
 
 Then add `hermes.hardware` to your bar layout (Settings → bar layout, or
